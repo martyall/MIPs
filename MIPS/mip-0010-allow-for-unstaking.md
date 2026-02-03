@@ -131,6 +131,9 @@ let rebalance_stake_for_transaction tx total_stake =
       |> adjust fee_payer (-amount)
       |> adjust receiver_pk amount
 
+  (* TODO: If you are tranitioning from Some(myself) to None, do we also reset the stake for all 
+     accounts delegating to you to None?
+  *)
   | Command (Signed_command { fee_payer; fee; body = Stake_delegation { new_delegate } }) ->
       let total_stake = adjust fee_payer (-fee) in
       let old_delegate = get_delegate fee_payer in
