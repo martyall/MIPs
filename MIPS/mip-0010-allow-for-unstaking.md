@@ -57,7 +57,116 @@ as a sentinel value to designate that the account is non-staking. This value is 
 
 There is validation logic currently in the place governing a `Delegate Transaction` that would prevent you from delegating to such an account, so updating that logic is part of this proposal.
 
+### Unstaked by default
+When new accounts are created, their delegate field will be set to `empty` rather then themselves.
+
+### Allow Unstaking Txs
+Currently the system does not allow a `Delegation Transaction` where the recipient is an "invalid" account. The `empty` account is considered an invalid recipient, so this will need to be changed.
+
 ### Maintaining the total_stake
+The `total_stake` is an accumulated value that is maintained by the protocol level. The current proposal is to maintain it to part of the block headers, though there are other ways to do this. Transactions will update this value as a side-effect (ie they do not declare it explicitly), and the updates will depend on 
+1. The type of transaction
+2. The state of `Account`s invovled, particularly their delegation status
+3. The current `total_stake`
+
+See the [Reference Implementation](#reference-implementation) section for precise details.
+
+### Changing the VRF Threshold Check
+
+The VRF threshold check will change to use the `total_stake` rather than the `total_currency` to compute
+the threshold inequality. Roughly speaking it will change from
+
+```
+  vrf_output / 2^256 <= c * (1 - (1 - f)^(my_stake / total_currency))
+```
+to
+```
+  vrf_output / 2^256 <= c * (1 - (1 - f)^(my_stake / total_stake))
+```
+
+where `c` and `f` are protocol constants that will remain unchanged. [NB: The current codebase may use different variable names in this equation that obscure the point we're trying to make]
+
+## Rationale
+
+The rationale fleshes out the specification by describing what motivated the design and why particular design decisions were made. It should describe alternate designs that were considered and related work, e.g. how the feature is supported in other languages.
+
+## Backwards Compatibility
+
+This change is backwards incompatible. The new `total_stake` protocol parameter must be maintained, and the VRF threshold check is computed differently. The rules around the recipient of a `Delegate Transaction` will actually relax to allow transferring to the `empty` public key.
+
+## Test Cases
+
+### Core Functionality Tests
+
+**Test Case 1: Basic Opt-Out Mechanism**
+
+- Create account with significant balance
+- Delegate to `empty` address
+- Verify `total_stake` decreases by account balance
+- Verify account no longer participates in consensus slot calculations
+
+**Test Case 2: Opt-In Process**
+
+- Start with account delegated to `empty` address
+- Delegate to active validator
+- Verify `total_stake` increases by account balance
+- Verify account can participate in block production (if running validator)
+
+**Test Case 3: Balance Change Propagation**
+
+- Account delegated to `empty` address receives additional tokens from a delegating account
+- Verify `total_stake` decreases by the amount received
+- Account delegated to `empty` address sends tokens to an account that **doesn’t** delegate to the `empty` address
+- Verify `total_stake` increases by the amount sent
+
+**Test Case 4: Zero Balance Accounts**
+
+- Account with small balance delegates to `empty` address, using all of the funds for the delegation transaction fee
+- Verify `total_stake` decreases by the fee amount
+- Account receives tokens while delegated to `empty` address
+- Verify `total_stake` decreases by the amount of tokens received
+
+**Test Case 5: Rapid Delegation Changes**
+
+- Account rapidly switches between `empty` address and active validator
+- Verify `total_stake` updates correctly for each change
+- Verify no calculation errors
+
+**Test Case 6: Large Holder Opt-Out**
+
+- Account with >30% of total supply opts out
+- Verify network continues operating normally
+- Verify slot assignment calculations adjust correctly
+
+### Network Health Tests
+
+**Test Case 7: Post-Migration Block Production**
+
+- After migration, verify consistent block production
+- Verify no degradation in network performance
+
+**Test Case 8: Consensus Safety**
+
+- With reduced total participating stake, verify consensus safety properties
+- Test network behavior under various participation rates
+- Verify epoch transition handling with new stake calculations
+
+### Integration Tests
+
+**Test Case 9: GraphQL API Consistency**
+
+- Query total stake vs total supply via GraphQL
+- Verify delegation status queries return correct `empty` address information
+
+**Test Case 10: Multi-Ledger Consistency**
+
+- Verify all three ledgers (staking, next, genesis) updated consistently
+- Test epoch transitions with modified ledger states
+- Verify no inconsistencies between ledger stake calculations
+
+## Reference Implementation
+
+### Maintaining total_stake through transactions
 
 The `total_stake` parameter will need to be properly maintained when processing transactions. Transactions in the mina codebase have the following pseudo-code description:
 
@@ -115,11 +224,14 @@ the proposed semantics are as follows
    - get_delegate : Public_key.Compressed.t -> Public_key.Compressed.t option
    - get_balance : Public_key.Compressed.t -> Amount.t
    - is_opted_out pk = get_delegate pk |> Option.is_none
+
+* All three functions are assumed to return account's information based on ledger **before** applying the transaction being processed.
+  
 *)
 
-let rebalance_stake_for_transaction tx total_stake =
+let rebalance_stake_for_transaction tx initial_total_stake =
 
-  let adjust pk amount_delta =
+  let adjust pk amount_delta total_state =
     if is_opted_out pk then total_stake
     else total_stake + amount_delta
   in
@@ -127,8 +239,7 @@ let rebalance_stake_for_transaction tx total_stake =
   match tx with
   | Command (Signed_command { fee_payer; fee; body = Payment { receiver_pk; amount } }) ->
       total_stake
-      |> adjust fee_payer (-fee)
-      |> adjust fee_payer (-amount)
+      |> adjust fee_payer -(fee + amount)
       |> adjust receiver_pk amount
 
   (* TODO: If you are tranitioning from Some(myself) to None, do we also reset the `delegate` field 
@@ -150,7 +261,7 @@ let rebalance_stake_for_transaction tx total_stake =
       )
 
   | Fee_transfer transfers ->
-      One_or_two.fold transfers ~init:total_stake ~f:(fun acc transfer ->
+      One_or_two.fold transfers ~init:initial_total_stake ~f:(fun acc transfer ->
         adjust transfer.receiver_pk transfer.fee acc
       )
 
@@ -159,109 +270,32 @@ let rebalance_stake_for_transaction tx total_stake =
 
   | Coinbase { receiver; amount; fee_transfer = Some ft } ->
       let total_stake = adjust receiver amount in
-      One_or_two.fold ft ~init:total_stake ~f:(fun acc transfer ->
+      One_or_two.fold ft ~init:initial_total_stake ~f:(fun acc transfer ->
         adjust transfer.receiver_pk transfer.fee acc
       )
 ```
 
-### Changing the VRF Threshold Check
+these updates should be run as each transaction is process. The flow will likely mimic the way we currently track `supply_increase`.
 
-The VRF threshold check will change to use the `total_stake` rather than the `total_currency` to compute
-the threshold inequality. Roughly speaking it will change from
+### Calculating total_stake at genesis
 
+The total stake at the HF genesis is simply the sum over all mina-based accounts where the `delegate` field is not the `empty` account.
+
+```ocaml
+let genesis_ledger_total_stake ~ledger =
+  Mina_ledger.Ledger.foldi ~init:Currency.Amount.zero (Lazy.force ledger)
+    ~f:(fun _addr sum (account : Mina_base.Account.t) ->
+      if Mina_base.(
+          Token_id.equal account.token_id Token_id.default && 
+          not (Account.equal account.delegate Account.empty)
+        ) then
+        Currency.Amount.add sum (Currency.Balance.to_amount @@ account.balance)
+        |> Base.Option.value_exn ?here:None ?error:None
+             ~message:"failed to calculate total stake in genesis ledger"
+      else sum )
 ```
-  vrf_output / 2^256 <= c * (1 - (1 - f)^(my_stake / total_currency))
-```
-to
-```
-  vrf_output / 2^256 <= c * (1 - (1 - f)^(my_stake / total_stake))
-```
 
-where `c` and `f` are protocol constants that will remain unchanged. [NB: The current codebase may use different variable names in this equation that obscure the point we're trying to make]
-
-## Rationale
-
-The rationale fleshes out the specification by describing what motivated the design and why particular design decisions were made. It should describe alternate designs that were considered and related work, e.g. how the feature is supported in other languages.
-
-## Backwards Compatibility
-
-This change is backwards incompatible. The new `total_stake` protocol parameter must be maintained, and the VRF threshold check is computed differently. The rules around the recipient of a `Delegate Transaction` will actually relax to allow transferring to the `empty` public key.
-
-## Test Cases
-
-### Core Functionality Tests
-
-**Test Case 1: Basic Opt-Out Mechanism**
-
-- Create account with significant balance
-- Delegate to `empty` address
-- Verify `total_stake` decreases by account balance
-- Verify account no longer participates in consensus slot calculations
-
-**Test Case 2: Opt-In Process**
-
-- Start with account delegated to `empty` address
-- Delegate to active validator
-- Verify `total_stake` increases by account balance
-- Verify account can participate in block production (if running validator)
-
-**Test Case 3: Balance Change Propagation**
-
-- Account delegated to `empty` address receives additional tokens from a delegating account
-- Verify `total_stake` decreases by the amount received
-- Account delegated to `empty` address sends tokens to an account that **doesn’t** delegate to the `empty` address
-- Verify `total_stake` increases by the amount sent
-
-### Hard Fork Migration Tests
-
-**Test Case 4: Zero Balance Accounts**
-
-- Account with small balance delegates to `empty` address, using all of the funds for the delegation transaction fee
-- Verify `total_stake` decreases by the fee amount
-- Account receives tokens while delegated to `empty` address
-- Verify `total_stake` decreases by the amount of tokens received
-
-**Test Case 5: Rapid Delegation Changes**
-
-- Account rapidly switches between `empty` address and active validator
-- Verify `total_stake` updates correctly for each change
-- Verify no calculation errors
-
-**Test Case 6: Large Holder Opt-Out**
-
-- Account with >30% of total supply opts out
-- Verify network continues operating normally
-- Verify slot assignment calculations adjust correctly
-
-### Network Health Tests
-
-**Test Case 7: Post-Migration Block Production**
-
-- After migration, verify consistent block production
-- Verify no degradation in network performance
-
-**Test Case 8: Consensus Safety**
-
-- With reduced total participating stake, verify consensus safety properties
-- Test network behavior under various participation rates
-- Verify epoch transition handling with new stake calculations
-
-### Integration Tests
-
-**Test Case 9: GraphQL API Consistency**
-
-- Query total stake vs total supply via GraphQL
-- Verify delegation status queries return correct `empty` address information
-
-**Test Case 10: Multi-Ledger Consistency**
-
-- Verify all three ledgers (staking, next, genesis) updated consistently
-- Test epoch transitions with modified ledger states
-- Verify no inconsistencies between ledger stake calculations
-
-## Reference Implementation
-
-TODO
+Without considering further related proposals, at first HF this would be simply the `total_currency` (See implementation of `genesis_ledger_total_currency`).
 
 ## Security Considerations
 
