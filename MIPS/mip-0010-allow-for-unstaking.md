@@ -266,7 +266,7 @@ let rebalance_stake_for_transaction tx initial_total_stake =
       )
 
   | Coinbase { receiver; amount; fee_transfer = None } ->
-      adjust receiver amount
+      adjust receiver amount initial_total_stake
 
   | Coinbase { receiver; amount; fee_transfer = Some ft } ->
       let total_stake = adjust receiver amount in
