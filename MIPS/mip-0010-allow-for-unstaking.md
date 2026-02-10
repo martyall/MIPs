@@ -238,24 +238,20 @@ let rebalance_stake_for_transaction tx initial_total_stake =
 
   match tx with
   | Command (Signed_command { fee_payer; fee; body = Payment { receiver_pk; amount } }) ->
-      total_stake
+      initial_total_stake
       |> adjust fee_payer -(fee + amount)
       |> adjust receiver_pk amount
 
-  (* TODO: If you are tranitioning from Some(myself) to None, do we also reset the `delegate` field 
-     for all accounts delegating to you to None?
-  *)
   | Command (Signed_command { fee_payer; fee; body = Stake_delegation { new_delegate } }) ->
-      let total_stake = adjust fee_payer (-fee) in
       let old_delegate = get_delegate fee_payer in
-      let balance = get_balance fee_payer in
+      let old_balance = get_balance fee_payer in
       match old_delegate, new_delegate with
-        | Some _, None -> total_stake - balance
-        | None, Some _ -> total_stake + balance
-        | _ -> total_stake
+        | Some _, None -> total_stake - old_balance
+        | None, Some _ -> total_stake + old_balance - fee
+        | _ -> total_stake - fee
 
   | Command (Zkapp_command { fee_payer; account_updates; _ }) ->
-      let total_stake = adjust fee_payer.public_key (-fee_payer.fee) in
+      let total_stake = adjust fee_payer.public_key (-fee_payer.fee) initial_total_stake in
       List.fold account_updates ~init:total_stake ~f:(fun acc update ->
         adjust update.public_key update.balance_change acc
       )
@@ -269,9 +265,9 @@ let rebalance_stake_for_transaction tx initial_total_stake =
       adjust receiver amount initial_total_stake
 
   | Coinbase { receiver; amount; fee_transfer = Some ft } ->
-      let total_stake = adjust receiver amount in
+      let total_stake = adjust receiver amount initial_total_stake in
       One_or_two.fold ft ~init:initial_total_stake ~f:(fun acc transfer ->
-        adjust transfer.receiver_pk transfer.fee acc
+        adjust transfer.receiver_pk transfer.fee acc 
       )
 ```
 
